@@ -16,6 +16,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use arc_swap::ArcSwapOption;
+use nblock::task::IntoTask;
 use spinning_top::Spinlock;
 
 pub extern crate cron;
@@ -49,21 +51,47 @@ impl Builder {
         self
     }
     pub fn build(mut self) -> Result<Runtime, io::Error> {
+        let pending_context = Arc::new(ArcSwapOption::<RuntimeContext>::new(None));
+        let tokio_thread_start_func = {
+            let pending_context = Arc::clone(&pending_context);
+            move || loop {
+                if let Some(pending_context) = pending_context.load_full() {
+                    THREADLOCAL_CONTEXT.replace(Some(pending_context));
+                    return;
+                }
+                thread::yield_now();
+            }
+        };
+        let nblock_thread_start_func = {
+            let pending_context = Arc::clone(&pending_context);
+            move |_| loop {
+                if let Some(pending_context) = pending_context.load_full() {
+                    THREADLOCAL_CONTEXT.replace(Some(pending_context));
+                    return;
+                }
+                thread::yield_now();
+            }
+        };
         let nblock = self
             .nblock
+            .with_thread_start_hook(nblock_thread_start_func)
             .build()
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-        let tokio = Spinlock::new(Some(self.tokio.build()?));
+        let tokio = Spinlock::new(Some(
+            self.tokio
+                .on_thread_start(tokio_thread_start_func)
+                .build()?,
+        ));
         let runflag = Arc::clone(nblock.runflag());
         let spawn_count = Arc::new(AtomicUsize::new(0));
-        Ok(Runtime {
-            context: Arc::new(RuntimeContext {
-                nblock,
-                tokio,
-                runflag,
-                spawn_count,
-            }),
-        })
+        let context = Arc::new(RuntimeContext {
+            nblock,
+            tokio,
+            runflag,
+            spawn_count,
+        });
+        pending_context.store(Some(Arc::clone(&context)));
+        Ok(Runtime { context })
     }
 }
 
@@ -138,7 +166,13 @@ impl Runtime {
                 "runtime shutting down",
             ));
         }
-        Ok(self.context.nblock.spawn(task_name, task))
+        Ok(self.context.nblock.spawn(
+            task_name,
+            ContextSettingTask {
+                task,
+                context: Arc::clone(&self.context),
+            },
+        ))
     }
 
     pub fn spawn_thread<T, F>(&self, name: String, func: F) -> io::Result<thread::JoinHandle<T>>
@@ -155,6 +189,7 @@ impl Runtime {
         let context = Arc::clone(&self.context);
         thread::Builder::new().name(name).spawn(move || {
             context.spawn_count.fetch_add(1, Ordering::Relaxed);
+            THREADLOCAL_CONTEXT.replace(Some(Arc::clone(&context)));
             let x = func();
             context.spawn_count.fetch_sub(1, Ordering::Relaxed);
             x
@@ -204,6 +239,18 @@ impl Runtime {
             thread::park_timeout(Duration::from_secs(1))
         }
         Ok(())
+    }
+}
+
+struct ContextSettingTask<T: IntoTask> {
+    task: T,
+    context: Arc<RuntimeContext>,
+}
+impl<T: IntoTask> IntoTask for ContextSettingTask<T> {
+    type Task = T::Task;
+    fn into_task(self) -> Self::Task {
+        THREADLOCAL_CONTEXT.replace(Some(self.context));
+        self.task.into_task()
     }
 }
 

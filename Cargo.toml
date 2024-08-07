@@ -1,6 +1,6 @@
 [package]
 name = "xrm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Eric Thill"]
@@ -11,6 +11,7 @@ categories = ["concurrency","rust-patterns"]
 exclude = ["Cargo.lock"]
 
 [dependencies]
+arc-swap = "1.7.1"
 cron = "0.12.1"
 futures = "0.3.30"
 nblock = "0.3.0"
