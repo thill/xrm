@@ -99,10 +99,12 @@ pub struct Runtime {
     context: Arc<RuntimeContext>,
 }
 impl Runtime {
+    /// start creating a new runtime instance
     pub fn builder() -> Builder {
         Builder::new()
     }
 
+    /// get the current thread's thread-local runtime, and *panic* if it is not set
     pub fn get() -> Arc<Runtime> {
         match Runtime::get_threadlocal() {
             None => panic!("threadlocal runtime not found"),
@@ -110,24 +112,29 @@ impl Runtime {
         }
     }
 
+    /// get the current thread's thread-local runtime, which will be automatically set for all threads managed by this runtime
     pub fn get_threadlocal() -> Option<Arc<Runtime>> {
         THREADLOCAL_CONTEXT
             .with_borrow(|x| x.as_ref().map(|x| Arc::clone(&x)))
             .map(|context| Arc::new(Self { context }))
     }
 
+    /// set this instance of the runtime to the thread-local runtime
     pub fn set_threadlocal(&self) {
         THREADLOCAL_CONTEXT.replace(Some(Arc::clone(&self.context)));
     }
 
+    /// helper function to synchronously block on the given future
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         futures::executor::block_on(future)
     }
 
+    /// get the underlying runflag used to determine if the runtime should keep running
     pub fn runflag<'a>(&'a self) -> &'a Arc<AtomicBool> {
         &self.context.runflag
     }
 
+    /// spawn an async task on the [`tokio`] thread pool
     pub fn spawn_async<F>(&self, future: F) -> io::Result<tokio::task::JoinHandle<F::Output>>
     where
         F: Future + Send + 'static,
@@ -140,6 +147,7 @@ impl Runtime {
         Ok(rt.spawn(future))
     }
 
+    /// spawn a blocking task on the [`tokio`] thread pool
     pub fn spawn_blocking<T, F>(&self, func: F) -> io::Result<tokio::task::JoinHandle<F::Output>>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -152,6 +160,7 @@ impl Runtime {
         Ok(rt.spawn_blocking(func))
     }
 
+    /// spawn a nonblocking [`nblock`] task
     pub fn spawn_nonblocking<T>(
         &self,
         task_name: &str,
@@ -175,6 +184,7 @@ impl Runtime {
         ))
     }
 
+    /// spawn a traditional [`std::thread`]
     pub fn spawn_thread<T, F>(&self, name: String, func: F) -> io::Result<thread::JoinHandle<T>>
     where
         T: Send + 'static,
@@ -204,6 +214,7 @@ impl Runtime {
     //     todo!()
     // }
 
+    /// set the runflag to false, waiting for all threads to gracefully exit before returning
     pub fn shutdown(&self, timeout: Option<Duration>) -> Result<(), TimedOutError> {
         // set shared runflag to false
         self.context.runflag.store(false, Ordering::Relaxed);
@@ -222,11 +233,18 @@ impl Runtime {
         )
     }
 
+    /// set the stop flag to shutdown asynchronously
+    pub fn stop(&self) {
+        self.runflag().store(false, Ordering::Relaxed);
+    }
+
+    /// join this instance of runtime indefinitely, waiting for it to shutdown
     pub fn join(&self) {
         self.join_timeout(SystemTime::UNIX_EPOCH + Duration::from_millis(u64::MAX))
             .ok();
     }
 
+    /// join this instance of runtime until it shuts down or the given timeout is elapsed
     fn join_timeout(&self, timeout_at: SystemTime) -> Result<(), TimedOutError> {
         while self.context.runflag.load(Ordering::Relaxed)
             || self.context.nblock.active_task_count() > 0
