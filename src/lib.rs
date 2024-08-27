@@ -87,6 +87,7 @@ impl Builder {
         let context = Arc::new(RuntimeContext {
             nblock,
             tokio,
+            tokio_running: Arc::new(AtomicBool::new(true)),
             runflag,
             spawn_count,
         });
@@ -220,9 +221,13 @@ impl Runtime {
         self.context.runflag.store(false, Ordering::Relaxed);
 
         // stop tokio
-        let mut tokio = self.context.tokio.lock();
-        if let Some(tokio) = tokio.take() {
-            tokio.shutdown_timeout(timeout.unwrap_or(Duration::from_secs(u64::MAX)));
+        let tokio = self.context.tokio.lock().take();
+        if let Some(tokio) = tokio {
+            match timeout {
+                None | Some(Duration::ZERO) => tokio.shutdown_background(),
+                Some(timeout) => tokio.shutdown_timeout(timeout),
+            }
+            self.context.tokio_running.store(false, Ordering::Relaxed);
         }
 
         // wait for shutdown to complete or timeout
@@ -231,11 +236,6 @@ impl Runtime {
                 .map(|x| SystemTime::now() + x)
                 .unwrap_or_else(|| SystemTime::UNIX_EPOCH + Duration::from_millis(u64::MAX)),
         )
-    }
-
-    /// set the stop flag to shutdown asynchronously
-    pub fn stop(&self) {
-        self.runflag().store(false, Ordering::Relaxed);
     }
 
     /// join this instance of runtime indefinitely, waiting for it to shutdown
@@ -249,6 +249,7 @@ impl Runtime {
         while self.context.runflag.load(Ordering::Relaxed)
             || self.context.nblock.active_task_count() > 0
             || self.context.spawn_count.load(Ordering::Relaxed) > 0
+            || self.context.tokio_running.load(Ordering::Relaxed)
             || self.context.tokio.lock().is_some()
         {
             if SystemTime::now() > timeout_at {
@@ -275,6 +276,7 @@ impl<T: IntoTask> IntoTask for ContextSettingTask<T> {
 struct RuntimeContext {
     nblock: nblock::Runtime,
     tokio: Spinlock<Option<tokio::runtime::Runtime>>,
+    tokio_running: Arc<AtomicBool>,
     runflag: Arc<AtomicBool>,
     spawn_count: Arc<AtomicUsize>,
 }
@@ -313,4 +315,31 @@ impl ScheduleHandle {
 
 thread_local! {
     static THREADLOCAL_CONTEXT: RefCell<Option<Arc<RuntimeContext>>> = RefCell::new(None);
+}
+
+#[cfg(test)]
+mod test {
+    use nblock::{idle::Backoff, selector::RoundRobinSelector};
+
+    use super::*;
+    #[test]
+    fn shutdown_no_timeout() {
+        let runtime = Runtime::builder()
+            .with_nblock(|builder| {
+                builder.set_thread_selector(
+                    RoundRobinSelector::builder()
+                        .with_thread_ids(vec![0, 1])
+                        .with_idle(Backoff::default())
+                        .build()
+                        .unwrap(),
+                );
+            })
+            .with_tokio(|builder| {
+                builder.enable_all().worker_threads(4);
+            })
+            .build()
+            .unwrap();
+
+        runtime.shutdown(None).unwrap();
+    }
 }
